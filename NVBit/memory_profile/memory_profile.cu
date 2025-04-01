@@ -66,19 +66,24 @@ enum class RecvThreadState {
     FINISHED,
 };
 
-/***************** Memory Profile Collection ***********************************/
+
+
+/**************************** Memory Profile Collection Code Section Start ***********************************/
 constexpr uint32_t MAX_SM{128};
-constexpr uint32_t BLOCK_SIZE{7};	// Cache Line by default
+constexpr uint32_t BLOCK_SIZE{7};   // Cache Line by default
 uint64_t inline get_block_address(uint64_t addr) {return addr >> BLOCK_SIZE;}
+// <ADDR, Access Count>
 using MemoryBlockStats = std::unordered_map<uint64_t, uint64_t>;
 
+// This straucture tracks the blocks for a particular logical memory type
 struct MemAttr
 {
-    MemoryBlockStats uniqueBlocks;
-    uint64_t totAccesses{0};
+    MemoryBlockStats uniqueBlocks;  // all unique blocks ever used
+    uint64_t totAccesses{0};        // all accesses to this memory type
     uint64_t reads{0};
-    uint64_t actMemThread{0};
+    uint64_t actMemThread{0};       // for each access this tracks how many threads are accessing memory
 
+    // Update the Global Unique Blocks from this SM's unique blocks
     MemoryBlockStats & merge_blocks(MemoryBlockStats &gb)
     {
         for(auto &b : uniqueBlocks)
@@ -100,35 +105,43 @@ struct MemAttr
     }
 };
 
+// This structure tracks all memory accesses done by a SM
 struct SMMemoryProfile
 {
-    MemAttr shmem_attr;
-    MemAttr chmem_attr;
-    std::ofstream trace_fp;
+    MemAttr shmem_attr;     // Shared memory statistics
+    MemAttr chmem_attr;     // Global memory statistics
+    std::ofstream trace_fp; // memory access trace output for this SM
 
+    // Update and record the memory access performed by a warp of this SM
     void update(uint64_t *addrs, bool is_read, int m_type)
     {
-	MemAttr &attr = (m_type == static_cast<int>(InstrType::MemorySpace::SHARED)) ? shmem_attr : chmem_attr;
-	std::unordered_set<uint64_t> warp_blocks;
-	for(auto i{0}; i < 32; i++)
-	{
-		if(addrs[i]) {
-			warp_blocks.insert(get_block_address(addrs[i]));
-			attr.actMemThread++;
-		}
-	}
-	attr.totAccesses++;
-	if(is_read)
-		attr.reads++;
-	for(const auto &b : warp_blocks)
-		attr.uniqueBlocks[b]++;
+        MemAttr &attr = (m_type == static_cast<int>(InstrType::MemorySpace::SHARED)) ? shmem_attr : chmem_attr;
+        std::unordered_set<uint64_t> warp_blocks;
+
+        // collect only the unique blocks per warp
+        for(auto i{0}; i < 32; i++)
+        {
+            if(addrs[i])
+            {
+                warp_blocks.insert(get_block_address(addrs[i]));
+                attr.actMemThread++;
+            }
+        }
+        attr.totAccesses++;
+        if(is_read)
+            attr.reads++;
+        // add/updtade the SM wide unique blocks
+        for(const auto &b : warp_blocks)
+            attr.uniqueBlocks[b]++;
     }
 
+    // how much capacity of shared memory been used
     uint64_t shmem_cap_util()
     {
         return shmem_attr.uniqueBlocks.size();
     }
 
+    // Update the Global Unique Blocks from this SM's unique blocks
     MemoryBlockStats & merge_chmem_blocks(MemoryBlockStats &gb)
     {
         return chmem_attr.merge_blocks(gb);
@@ -151,14 +164,13 @@ struct SMMemoryProfile
     }
 };
 
+// Main structure that holds memory info GPU wide
 SMMemoryProfile SM_Metrics[MAX_SM];
 
 void displayMemoryHistogram(uint64_t NUM_SM, uint64_t ShMEM_Size, uint64_t ChMEM_Size)
 {
-    // aggregated list of all block addresses
-    MemoryBlockStats allCHMemBlocks;
+    /********************* SHARED MEMORY STATS *********************/
     ShMEM_Size >>= BLOCK_SIZE;
-    ChMEM_Size >>= BLOCK_SIZE;
 
     if(ShMEM_Size)
     {
@@ -166,22 +178,22 @@ void displayMemoryHistogram(uint64_t NUM_SM, uint64_t ShMEM_Size, uint64_t ChMEM
 
 	    for(auto &sm : SM_Metrics)
 	    {
-		auto cap{sm.shmem_cap_util()};
-		auto bin{0};
-		if(cap == ShMEM_Size)
-		    bin = 5;
-		else if(cap >= 3 * ShMEM_Size / 4)
-		    bin = 4;
-		else if(cap >= ShMEM_Size / 2)
-		    bin = 3;
-		else if(cap >= ShMEM_Size / 4)
-		    bin = 2;
-		else if(cap)
-		    bin = 1;
-		shMemUtil[bin]++;
+            auto cap{sm.shmem_cap_util()};
+            auto bin{0};
+            if(cap == ShMEM_Size)
+                bin = 5;
+            else if(cap >= 3 * ShMEM_Size / 4)
+                bin = 4;
+            else if(cap >= ShMEM_Size / 2)
+                bin = 3;
+            else if(cap >= ShMEM_Size / 4)
+                bin = 2;
+            else if(cap)
+                bin = 1;
+            shMemUtil[bin]++;
 	    }
 
-	    std::cout << ">>>>>>>>>> Shared Mmeory Utilization Metrics (SM Capacity --> SM Count) <<<<<<<<\n";
+	    std::cout << ">>>>>>>>>> Shared Mmeory Capacity Utilization Metrics (SM Capacity --> SM Count) <<<<<<<<\n";
 	    std::cout << "100% " << shMemUtil[5] << std::endl;
 	    std::cout << "75% " << shMemUtil[4] << std::endl;
 	    std::cout << "50% " << shMemUtil[3] << std::endl;
@@ -193,32 +205,41 @@ void displayMemoryHistogram(uint64_t NUM_SM, uint64_t ShMEM_Size, uint64_t ChMEM
     else
 	    std::cout << ">>>>>>>>>>>>>>>>> NO SHARED MEMORY UTILIZATION <<<<<<<<<<<<<<\n\n";
 
+    
+    /********************* CACHED MEMORY STATS *********************/
+    
+    // aggregated list of all block addresses
+    ChMEM_Size >>= BLOCK_SIZE;
+    MemoryBlockStats allCHMemBlocks;
     for(auto &sm : SM_Metrics)
-	sm.merge_chmem_blocks(allCHMemBlocks);
+	    sm.merge_chmem_blocks(allCHMemBlocks);
 
+    // collect the block accesses for all SM
     std::vector<uint64_t> allBlockStats;
     auto totAcc{0};
-    for(auto &b: allCHMemBlocks) {
+    for(auto &b: allCHMemBlocks)
+    {
         allBlockStats.push_back(b.second);
         totAcc += b.second;
     }
     if(totAcc) {
         std::sort(allBlockStats.begin(), allBlockStats.end(), std::greater<uint64_t>());
+
         std::cout << " >>>>>> Cached Mmeory Details <<<<<<< \n";
         std::cout << "Total Cached Memory Accesses " << totAcc << std::endl;
-        std::cout << "Cache Memory Utilization " << allBlockStats.size() << " ( " << (allBlockStats.size() * 100) / ChMEM_Size << "% )\n";
+        std::cout << "Cache Memory Capacity Utilization " << allBlockStats.size() << " ( " << (allBlockStats.size() * 100) / ChMEM_Size << "% )\n";
 
         uint64_t acc_bin{0};
         uint64_t blk_count{0};
         uint64_t interval = totAcc/20;  // every 5%
-	uint64_t accPercent{0};
+	    uint64_t accPercent{0};
         for(uint64_t &blk : allBlockStats)
         {
             acc_bin += blk;
             blk_count++;
             if(acc_bin >= interval)
             {
-		accPercent += acc_bin;
+		        accPercent += acc_bin;
                 std::cout << (accPercent * 100) / totAcc << "% " << blk_count << std::endl;
                 acc_bin = blk_count = 0;
             }
@@ -229,7 +250,8 @@ void displayMemoryHistogram(uint64_t NUM_SM, uint64_t ShMEM_Size, uint64_t ChMEM
     else
         std::cout << "No Cached Mmeory Accesses!!\n";
 }
-/********************************************************************************/
+/**************************** Memory Profile Collection Code Section End ***********************************/
+
 
 struct CTXstate {
     /* context id */
@@ -769,7 +791,7 @@ void nvbit_at_term()
 		for(auto i{0}; i < MAX_SM; i++)
 		{
 			SM_Metrics[i].display(i);
-		}
+		}+
 	break;
 	case 1:
 	break;
